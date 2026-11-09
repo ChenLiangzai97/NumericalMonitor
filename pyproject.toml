@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "numerical-monitor"
+version = "0.1.0"
+description = "PyTorch activation, gradient and optimizer numerical monitoring"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.4"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.9"]
+
+[tool.setuptools.packages.find]
+include = ["numerical_monitor*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E9", "F"]
