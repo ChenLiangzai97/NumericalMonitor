@@ -1,4 +1,4 @@
-"""Analytical attention checks, including mask and sampling edge cases."""
+"""用可解析结果验证 Attention 统计，覆盖 mask 与采样边界条件。"""
 
 import math
 import unittest

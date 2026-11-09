@@ -1,10 +1,20 @@
-"""FSDP1 compatibility collectors derived from the supplied shard monitors.
+"""FSDP1 梯度分片归约与数值统计，基于原有梯度监控组件扩展。
 
-All ranks must call the same methods. ``process_group`` must contain each shard
-exactly once (the shard group, never the HSDP replica group). No full parameters
-or gradients are gathered. Call the fallback after accumulation, synchronization
-and AMP unscale, before clipping. The optional private hook has a narrower
-single-backward contract and is never installed merely by importing this module.
+提供：
+- ``FSDPGradNormOptimizer``：非 Hook 备用路径，保留 prepare/finalize 模式。
+- ``HSDPGradStatsHook``：显式启用的 FSDP1 后向内统计 Hook。
+- ``reduce_shard_grad_norms``：分片梯度范数归约，支持异步等待。
+- ``extract_fsdp1_config``：从原训练框架提取 FSDP1 桥接配置。
+
+HSDP 关键注意：
+  HSDP 下梯度已在 replica group 间同步，因此统计 all_reduce 只能在
+  shard group 内做，不能跨 replica group，否则平方和会被重复求和，
+  导致 norm 放大。FSDP1 的 process_group 为分片通信组，
+  _inter_node_pg 为复制通信组；调用方必须传入正确的 shard group。
+
+所有 rank 必须以相同顺序参与统计；这里只归约小型统计张量，不收集完整参数或梯度。
+备用路径应在梯度累积、通信和 AMP 反缩放完成后、梯度裁剪前调用。
+私有 Hook 仅支持每步一次同步 backward，导入模块不会自动安装补丁。
 """
 
 import inspect
@@ -15,7 +25,7 @@ import torch.distributed as dist
 
 
 class _Work:
-    """Own snapshots until all asynchronous reductions have completed."""
+    """持有统计快照，直到所有异步归约完成，避免缓冲区提前复用。"""
 
     def __init__(self, square, maximum=None, counts=None, works=()):
         self.square = square
@@ -34,6 +44,8 @@ class _Work:
 
 
 class _AsyncNormResult:
+    """异步范数结果；首次 wait 等待通信并开方，后续复用结果。"""
+
     def __init__(self, square, work):
         self._square = square
         self._work = work
@@ -47,6 +59,7 @@ class _AsyncNormResult:
 
 
 def _reduce(tensor, op, group, async_op=True):
+    """分布式已初始化且统计张量非空时归约；单进程模式无需通信。"""
     if dist.is_available() and dist.is_initialized() and tensor.numel():
         return dist.all_reduce(tensor, op=op, group=group, async_op=async_op)
     return None
@@ -54,9 +67,10 @@ def _reduce(tensor, op, group, async_op=True):
 
 @torch.no_grad()
 def reduce_shard_grad_norms(sq_norms, process_group=None, is_squared=True, async_op=False):
-    """Reduce local squares, or square local norms first when is_squared=False.
+    """归约本地分片平方和，得到每个参数的完整梯度范数。
 
-    Unlike the old helper, this does not mutate the caller's tensor.
+    is_squared=True 时输入为平方和；False 时先对输入范数取平方。
+    async_op=True 返回带 wait() 的结果对象；不会原地修改调用方的张量。
     """
     square = sq_norms.detach().clone() if is_squared else sq_norms.detach().square()
     work = _Work(square, works=[_reduce(square, dist.ReduceOp.SUM, process_group)])
@@ -65,11 +79,17 @@ def reduce_shard_grad_norms(sq_norms, process_group=None, is_squared=True, async
 
 
 class FSDPGradNormOptimizer:
-    """Asynchronous per-parameter shard statistics, preserving prepare/finalize.
+    """FSDP1 逐参数梯度统计，保留原有 prepare/finalize 生命周期。
 
-    Shared parameter aliases are deduplicated by identity; their group membership
-    is merged. ``last_stats`` is available on every rank; only the writer invokes
-    logging callbacks. Zero gradients and missing gradients are retained.
+    生命周期（由 GradientMonitor 或训练循环调用）：
+      1. __init__：构建参数到监控组的映射，共享参数按对象身份去重。
+      2. prepare：扫描最终本地梯度分片，生成平方和、最大绝对值及 NaN/Inf 计数，
+         对小型统计张量启动异步 SUM/MAX/SUM 归约，可与 optimizer.step() 重叠。
+      3. finalize：等待归约，计算完整参数及监控组的梯度指标，并写入日志。
+
+    共享参数的组成员关系会合并；last_stats 在所有 rank 可用，仅主进程调用日志接口。
+    零梯度和没有梯度的参数均保留，避免异常消失或指标随参数缺席而变化。
+    当前实现为每次采样创建独立统计快照，不再声称预分配零分配或双缓冲。
     """
 
     def __init__(
@@ -86,6 +106,7 @@ class FSDPGradNormOptimizer:
         self._param_names = []
         self._param_refs = []
         self._memberships = []
+        # 共享权重只统计一次；别名对应的监控组仍合并到同一个原参数。
         canonical = {}
         for name, param in monitored_params.items():
             if id(param) in canonical:
@@ -135,6 +156,7 @@ class FSDPGradNormOptimizer:
         )
 
     def _launch(self, result):
+        # 范数平方和与异常计数使用 SUM；局部极值使用 MAX，均仅沿分片组通信。
         result.works = [
             _reduce(result.square, dist.ReduceOp.SUM, self._process_group),
             _reduce(result.maximum, dist.ReduceOp.MAX, self._process_group),
@@ -145,7 +167,7 @@ class FSDPGradNormOptimizer:
 
     @torch.no_grad()
     def prepare(self):
-        """Snapshot final unscaled gradients before optimizer mutates them."""
+        """在优化器更新前快照最终的、已反缩放的梯度，并启动异步分片归约。"""
         if self._pending is not None:
             raise RuntimeError("finalize the previous prepare before preparing again")
         result = self._empty()
@@ -159,13 +181,14 @@ class FSDPGradNormOptimizer:
 
     @torch.no_grad()
     def finalize(self, work, cur_iter_num, tb_scalar_func=None, tb_text_func=None, logger=None):
+        """消费本次 prepare 的归约结果，计算逐参数、组级和全局指标。"""
         if work is None:
             return None
         if work is not self._pending:
             raise ValueError("work does not belong to the pending prepare")
         work.wait()
         self._pending = None
-        # One device-to-host transfer for floating statistics and one for counts.
+        # 浮点统计量和整数计数分别批量传回 CPU，避免逐参数多次 .item() 同步。
         values = torch.stack([work.square, work.maximum]).cpu().tolist()
         counts = work.counts.cpu().tolist()
         rows = {}
@@ -251,14 +274,25 @@ class FSDPGradNormOptimizer:
 
 
 class HSDPGradStatsHook(FSDPGradNormOptimizer):
-    """Opt-in compatibility hook using private FSDP1 callback metadata.
+    """FSDP1 后向内梯度统计 Hook，必须显式启用私有接口兼容路径。
 
-    Pass ``enable_private_hook=True`` explicitly. Only a single synchronized
-    backward per optimizer step is supported. For gradient accumulation use
-    FSDPGradNormOptimizer.prepare after the final backward instead. ``grad_scale``
-    rescales finite magnitudes only; overflow counts describe the captured shard.
-    Private callback signatures and metadata are checked before patch installation.
-    GPU stream/per-version validation is still required on the deployment stack.
+    通过 monkey-patch _post_reduce_grad_callback，在 FlatParameter 的梯度
+    reduce-scatter（以及 HSDP replica all-reduce）完成后，对 reduced shard
+    做分段统计，与剩余 backward 计算重叠；之后仅归约逐参数的小型统计张量。
+
+    生命周期：
+      1. __init__：构建 FlatParamHandle 分段元数据，校验后安装补丁。
+      2. reset：每步 backward 前重置统计，开启本步采集。
+      3. Hook 自动触发：按原参数在本地 shard 中的位置与长度提取 segment。
+      4. launch_all_reduce：backward 后启动异步归约，可与优化器更新重叠。
+      5. try_finalize：按采集步号消费结果、写日志，随后可开始下一轮。
+      6. uninstall_patch：等待未完成工作并恢复原回调。
+
+    需传 enable_private_hook=True；每个优化器更新步仅支持一次同步 backward。
+    梯度累积请在最后一次 backward 后使用 FSDPGradNormOptimizer.prepare。
+    grad_scale 用于修正捕获幅值，NaN/Inf 计数仍反映实际捕获分片的溢出情况。
+    安装前校验私有回调签名和元数据；部署时仍需验证具体版本与 GPU/NPU 流行为。
+    当前使用独立快照管理生命周期，advance_buffer 仅保留旧接口，不执行双缓冲切换。
     """
 
     def __init__(
@@ -303,6 +337,8 @@ class HSDPGradStatsHook(FSDPGradNormOptimizer):
                         raise RuntimeError(
                             "Unsupported FSDP1 metadata; use use_orig_params=True and prepare/finalize"
                         )
+                    # 分段元数据：原参数 id、本地 shard 起始偏移、有效元素长度。
+                    # 未落在本 rank 的原参数不生成 segment，避免重复统计。
                     segments = []
                     for param, info in zip(params, infos):
                         pid = ids.get(id(param))
@@ -313,6 +349,7 @@ class HSDPGradStatsHook(FSDPGradNormOptimizer):
             raise RuntimeError("No compatible FSDP1 handles found; no patch was installed")
         import torch.distributed.fsdp._runtime_utils as runtime
 
+        # 先验证兼容性，再安装补丁，初始化失败时不污染全局 FSDP 回调。
         callback = getattr(runtime, "_post_reduce_grad_callback", None)
         if callback is None or tuple(inspect.signature(callback).parameters) != (
             "state",
@@ -343,13 +380,14 @@ class HSDPGradStatsHook(FSDPGradNormOptimizer):
     def _capture(self, handle, grad):
         for pid, start, length in self._handle_meta.get(id(handle), ()):
             square, maximum, counts = self._measure(grad[start : start + length])
-            # Replace the latest shard, rather than summing norms from repeated
-            # callbacks: squared norms of accumulated gradients are not additive.
+            # 重复回调时使用最新分片替换统计，不能累加每次回调的平方和：
+            # 累积梯度的平方和不等于各次梯度平方和之和。
             self._captured.square[pid] = square / self._grad_scale**2
             self._captured.maximum[pid] = maximum / self._grad_scale
             self._captured.counts[:, pid] = counts
 
     def reset(self, *, grad_scale=1.0, gradient_accumulation=False):
+        """每步 backward 前重置统计；上一轮结果必须先消费。"""
         if self._pending is not None:
             raise RuntimeError("Finalize pending statistics before reset")
         if gradient_accumulation:
@@ -361,6 +399,7 @@ class HSDPGradStatsHook(FSDPGradNormOptimizer):
         self._active = True
 
     def launch_all_reduce(self, step):
+        """backward 后启动异步归约，固定采集步号并停止本轮 Hook 写入。"""
         if not self._active or self._pending is not None:
             raise RuntimeError("reset once before backward and finalize before next launch")
         self._active = False
@@ -368,6 +407,7 @@ class HSDPGradStatsHook(FSDPGradNormOptimizer):
         return self._launch(self._captured)
 
     def try_finalize(self, step, tb_scalar_func=None, tb_text_func=None, logger=None):
+        """按采集步号消费待完成结果；无匹配结果时返回 False。"""
         if self._pending is None or self._pending_step != step:
             return False
         self.finalize(self._pending, step, tb_scalar_func, tb_text_func, logger)
@@ -375,9 +415,10 @@ class HSDPGradStatsHook(FSDPGradNormOptimizer):
         return True
 
     def advance_buffer(self):
-        """Compatibility no-op: pending snapshots own their storage."""
+        """兼容旧接口的空操作：每个待完成快照拥有独立 storage，无需切换缓冲区。"""
 
     def uninstall_patch(self):
+        """恢复原回调；即使等待通信失败，也清理本实例持有的补丁。"""
         self._active = False
         try:
             if self._pending is not None:
@@ -399,11 +440,13 @@ class HSDPGradStatsHook(FSDPGradNormOptimizer):
 
 
 def _extract_shard_pg_from_fsdp1(wrapper):
+    """从 FSDP1 实例或其外层 wrapper 提取 shard process group。"""
     module = getattr(wrapper, "module", wrapper)
     return getattr(module, "process_group", None)
 
 
 def _find_fsdp_root_modules(trainer):
+    """找到 wrappers 中的 FSDP1 根模块；普通 DDP wrapper 跳过。"""
     from torch.distributed.fsdp import FullyShardedDataParallel
 
     wrappers = getattr(trainer.model, "wrappers", ())
@@ -415,7 +458,13 @@ def _find_fsdp_root_modules(trainer):
 
 
 def extract_fsdp1_config(trainer):
-    """Extract legacy trainer configuration, rejecting ambiguous shard groups."""
+    """从原训练框架提取 FSDP1 桥接配置，不混用多个分片通信组。
+
+    trainer.args.parallel_strategy 指定 ddp/fsdp1/fsdp2；model.wrappers
+    中的封装对象可通过 .module 访问 FSDP1 实例。
+    返回 is_fsdp1、process_group、needs_shard_reduction、fsdp_modules。
+    多个不同 shard group 必须分别创建采集器，不能归约到同一组。
+    """
     if getattr(trainer.args, "parallel_strategy", "ddp") != "fsdp1":
         return dict(
             is_fsdp1=False, process_group=None, needs_shard_reduction=False, fsdp_modules=[]

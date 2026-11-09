@@ -1,4 +1,4 @@
-"""Run a tiny CPU training loop and export all three monitoring paths."""
+"""运行小型 CPU 训练，演示数值、梯度/优化器与 Attention 三条监控路径。"""
 
 import argparse
 from pathlib import Path
@@ -82,14 +82,15 @@ def main():
             monitor.record_loss(per_sample_loss, step)
             loss = per_sample_loss.mean()
             loss.backward()
+            # 此时梯度累积已完成；AMP 场景需先反缩放，再记录裁剪前的梯度。
             monitor.capture_gradients(step)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             monitor.record_clipping(step)
+            # 前后入口必须紧邻同一次真实更新，才能计算准确的 Update / Weight Ratio。
             monitor.before_optimizer_step(step)
             optimizer.step()
             monitor.after_optimizer_step(step)
-            # Independent probe input illustrates the model-internal Q/K API;
-            # these tensors are not claimed to come from ToyModel's FFN.
+            # 独立构造 Q/K 演示显式探针接口，不把它们当作 ToyModel FFN 的内部特征。
             q, k = torch.randn(1, 2, 5, 4), torch.randn(1, 2, 5, 4)
             attention.observe("example_attention", q, k, step, is_causal=True)
             analyzer.step_forward(step)

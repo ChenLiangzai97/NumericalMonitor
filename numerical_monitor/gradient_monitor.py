@@ -1,4 +1,4 @@
-"""Optimizer-boundary monitoring; no gradient hooks or training mutations."""
+"""在优化器更新边界采集梯度与状态，不修改训练张量或接管训练流程。"""
 
 import csv
 import math
@@ -12,14 +12,16 @@ from .metrics import local_tensor, tensor_metrics
 
 
 class GradientMonitor:
-    """Monitor final accumulated gradients, parameters and optimizer updates.
+    """监控累积后的最终梯度、参数、Adam 状态和实际更新量。
 
-    Call capture_gradients after backward/synchronization and AMP unscale, before
-    clipping. Call before_optimizer_step immediately before the optimizer and
-    after_optimizer_step immediately after, with updated=False on a skipped step.
-    Every rank must call methods in the same order for sharded metrics. Explicit
-    process_group is ONLY the shard group for ordinary FSDP1 original parameters;
-    DDP replicas must not be summed. DTensor Shard placements are detected.
+    capture_gradients 必须在 backward、分布式同步和 AMP 反缩放完成后，
+    梯度裁剪前调用；本组件不执行反缩放或裁剪。
+    before_optimizer_step / after_optimizer_step 紧邻同一次更新，跳过更新时
+    由训练框架传入 updated=False，避免把跳过的步骤误报成一次正常更新。
+
+    分片统计要求各 rank 按一致顺序参与；仅日志写入限制在主 rank。
+    普通 FSDP1 原始参数须显式指定 shard_process_group；DDP 副本不再累加。
+    DTensor 根据 Shard 布局自动选择归约维度。
     """
 
     def __init__(
@@ -55,6 +57,7 @@ class GradientMonitor:
             monitored_params = dict(model.named_parameters())
         self.params = {}
         seen = set()
+        # 按参数对象去重，避免共享权重经多个路径出现时放大全局范数。
         for name, p in monitored_params.items():
             if id(p) in seen or (include and not re.search(include, name)):
                 continue
@@ -85,14 +88,17 @@ class GradientMonitor:
         self.records = []
         self._snapshots = {}
         self._snapshot_step = None
+        # 调用顺序校验独立于快照采样，非采样步也必须配对更新前后事件。
         self._pending_optimizer_step = None
         self._pre_clip = None
         self._clip_events = self._clip_triggered = 0
 
     def enable(self):
+        """启用采集；分布式场景须在所有相关 rank 上同步切换。"""
         self.enabled = True
 
     def disable(self):
+        """停止采集并释放参数快照；已产生的日志可另行 flush。"""
         self.enabled = False
         self._snapshots.clear()
         self._snapshot_step = None
@@ -100,6 +106,7 @@ class GradientMonitor:
         self._pre_clip = None
 
     def _emit(self, step, phase, layer, metric, value, scope="monitored_parameters"):
+        """只在主 rank 写入结果，不能用此处的限制包住上游分片归约。"""
         if not self.is_main:
             return
         value = float(value)
@@ -110,10 +117,12 @@ class GradientMonitor:
             self.log_scalar_fn(f"{phase}/{layer}/{metric}", value, step)
 
     def _groups(self, parameter):
+        """只归约分片维度；复制维度上的同一份数据不能重复计入。"""
         if hasattr(parameter, "placements"):
             groups = []
             for axis, placement in enumerate(parameter.placements):
                 if placement.is_partial():
+                    # Partial 是待求和的中间表示，对它直接取平方和不等价于最终梯度范数。
                     raise ValueError("Partial DTensor must be redistributed before monitoring")
                 if placement.is_shard():
                     groups.append(parameter.device_mesh.get_group(axis))
@@ -126,7 +135,11 @@ class GradientMonitor:
 
     @torch.no_grad()
     def _summaries(self, tensors):
-        """Reduce sufficient statistics in batches by device and shard topology."""
+        """按设备与分片通信组分桶，批量归约平方和、故障数和最大绝对值。
+
+        不收集完整张量；缺失梯度仍占据固定统计位置，确保各 rank 的通信形状一致。
+        平方和与计数用 SUM，最大绝对值用 MAX，不能混用同一种归约操作。
+        """
         buckets = {}
         for name, (tensor, parameter) in tensors.items():
             groups = self._groups(parameter)
@@ -142,8 +155,7 @@ class GradientMonitor:
                 raise ValueError("Sparse tensors are not supported")
             finite = torch.isfinite(x)
             safe = torch.where(finite, x, 0.0)
-            # Statistics buffer uses FP64 on CPU/CUDA to preserve large finite
-            # gradient square sums. NPU uses FP32 for backend compatibility.
+            # CPU/CUDA 用 FP64 累加大梯度平方和；NPU 用 FP32 兼容其后端支持。
             acc = torch.float32 if x.device.type == "npu" else torch.float64
             sums = torch.stack(
                 [
@@ -161,6 +173,7 @@ class GradientMonitor:
         result = {}
         for groups, rows in buckets.values():
             sums = torch.stack([r[1] for r in rows])
+            # 即使某 rank 缺少 FP64 梯度，也要保持 MAX buffer 的跨 rank dtype 一致。
             maxima = torch.stack([r[2] for r in rows]).to(sums.dtype)
             for group in groups:
                 dist.all_reduce(sums, op=dist.ReduceOp.SUM, group=group)
@@ -192,6 +205,7 @@ class GradientMonitor:
 
     @staticmethod
     def _norm(row):
+        """范数保留 NaN/Inf 故障信号，避免有限值子集掩盖训练异常。"""
         if row["nan_count"]:
             return math.nan
         if row["inf_count"]:
@@ -199,6 +213,7 @@ class GradientMonitor:
         return math.sqrt(row["sum_sq"])
 
     def _layer_rows(self, rows):
+        """按参数名父路径合并同层 weight、bias 等统计量。"""
         grouped = {}
         for name, row in rows.items():
             layer = name.rsplit(".", 1)[0] if "." in name else "root"
@@ -207,7 +222,7 @@ class GradientMonitor:
 
     @torch.no_grad()
     def capture_gradients(self, step, *, force=False):
-        """Read final, unscaled accumulated gradients; never unscale or clip."""
+        """读取最终、已反缩放的累积梯度，记录全局、逐层和逐参数指标。"""
         if not self.enabled or (not force and step % self.grad_interval):
             return None
         rows = self._summaries({n: (p.grad, p) for n, p in self.params.items()})
@@ -227,10 +242,10 @@ class GradientMonitor:
 
     @torch.no_grad()
     def record_clipping(self, step):
-        """Observe after the caller clips; return post/pre norm (1 = unchanged).
+        """裁剪后观察梯度，记录裁剪后/前范数之比；1 表示尺度未变。
 
-        Frequency is over observed clipping events, not unsampled steps. Global
-        norm clipping normally gives the same scale for every nonzero layer.
+        触发频率的分母仅包含实际观测的采样事件，不包含未采样步骤。
+        全局 norm clipping 下，各非零层通常具有相同缩放系数。
         """
         if not self.enabled:
             return None
@@ -265,7 +280,7 @@ class GradientMonitor:
         return ratios
 
     def record_loss(self, loss, step, name="total", *, scope="rank_local"):
-        """Observe supplied loss values; scalar input cannot reveal sample max."""
+        """统计传入的 loss；已归约标量无法还原样本级最大 loss。"""
         if not self.enabled:
             return None
         stats = tensor_metrics(torch.as_tensor(loss))
@@ -275,12 +290,14 @@ class GradientMonitor:
         return stats
 
     def record_lr(self, step):
+        """读取本次更新使用的各参数组 LR，须在 scheduler 改为下一步 LR 前调用。"""
         if self.enabled and self.optimizer:
             for i, group in enumerate(self.optimizer.param_groups):
                 self._emit(step, "Optimizer", f"group_{i}", "lr", group["lr"])
 
     @torch.no_grad()
     def before_optimizer_step(self, step):
+        """更新前采集参数，并在更新量采样步保存独立的本地参数快照。"""
         if not self.enabled:
             return
         if self._pending_optimizer_step is not None:
@@ -305,6 +322,7 @@ class GradientMonitor:
                 if layer in self.output_heads:
                     self._emit(step, "OutputHead", layer, "weight_norm", self._norm(row))
         if step % self.update_interval == 0:
+            # 快照会占用额外内存；用 update_interval/update_include 限制频率与范围。
             self._snapshot_step = step
             self._snapshots = {
                 n: local_tensor(p).clone()
@@ -314,6 +332,7 @@ class GradientMonitor:
 
     @torch.no_grad()
     def after_optimizer_step(self, step, *, updated=True):
+        """更新后比较同一步的真实参数差值，包含优化器与 weight decay 的共同效果。"""
         if not self.enabled:
             return
         if self._pending_optimizer_step != step:
@@ -357,7 +376,7 @@ class GradientMonitor:
 
     @torch.no_grad()
     def capture_optimizer_state(self, step):
-        """Read state after update; missing Adam state is explicitly unavailable."""
+        """读取更新后的 Adam 原始矩状态；未初始化的状态标记为不可用而非零。"""
         if not self.enabled or self.optimizer is None:
             return
         for state_key in ("exp_avg", "exp_avg_sq"):
@@ -381,6 +400,7 @@ class GradientMonitor:
             self._capture_adam_denominator(step)
 
     def _capture_adam_denominator(self, step):
+        """可选诊断：统计偏差修正、AMSGrad 与 eps 生效后的 Adam 分母尺度。"""
         tensors = {}
         for group in self.optimizer.param_groups:
             for p in group["params"]:
@@ -388,8 +408,8 @@ class GradientMonitor:
                 key = "max_exp_avg_sq" if group.get("amsgrad") else "exp_avg_sq"
                 if key not in state:
                     continue
-                # This optional diagnostic may synchronize the optimizer step
-                # scalar. It is sampled, never used to change the update.
+                # 读取优化器步数可能引入设备同步，因此仅在低频诊断中启用。
+                # 这里只解释更新尺度，不参与修改优化器的真实更新。
                 count = float(state.get("step", 0))
                 correction = 1 - group["betas"][1] ** count
                 if correction <= 0:
@@ -406,7 +426,7 @@ class GradientMonitor:
             self._emit(step, "Adam", layer, "bias_corrected_denominator_rms", value)
 
     def flush(self):
-        """Append CSV if configured, return consumed records and clear buffers."""
+        """追加 CSV，返回并清空已消费记录；未配置文件输出时也释放日志缓存。"""
         if not self.is_main or not self.records:
             return []
         if not self.save_dir:

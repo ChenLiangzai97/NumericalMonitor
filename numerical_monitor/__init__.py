@@ -1,4 +1,4 @@
-"""Training numerical monitoring with explicit sampling and phase boundaries."""
+"""训练数值监控：通过显式采样频率和训练阶段入口控制采集。"""
 
 from .attention import AttentionMonitor
 from .gradient_monitor import GradientMonitor

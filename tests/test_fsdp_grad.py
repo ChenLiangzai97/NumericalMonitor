@@ -1,4 +1,4 @@
-"""Regression coverage for the supplied FSDP collector interfaces."""
+"""原有 FSDP 采集接口的回归测试，覆盖分片归约及异步生命周期。"""
 
 import math
 import os
@@ -189,7 +189,7 @@ class FSDPCollectorTest(unittest.TestCase):
     @unittest.skipUnless(dist.is_available() and dist.is_gloo_available(), "Gloo unavailable")
     def test_two_rank_shard_sum_max_and_counts(self):
         with tempfile.TemporaryDirectory() as directory:
-            # Some hosted executors forbid local TCP sockets used by Gloo.
+            # 部分执行环境禁止 Gloo 使用的本地 TCP socket；先探测再运行双进程测试。
             try:
                 dist.init_process_group(
                     "gloo", init_method=f"file://{directory}/probe", rank=0, world_size=1

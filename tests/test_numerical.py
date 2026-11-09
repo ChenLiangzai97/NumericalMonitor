@@ -1,4 +1,4 @@
-"""Regression tests for forward statistics and the original public lifecycle."""
+"""前向统计和原有公共生命周期接口的回归测试。"""
 
 import csv
 import math
@@ -141,7 +141,7 @@ class NumericalAnalyzerTest(unittest.TestCase):
             outputs = [r for r in monitor.detail_buffer if r["type"] == "Output"]
             self.assertEqual(len(outputs), expected)
             self.assertTrue(all(r["step"] == 12 for r in outputs))
-            # Parameters retain a single record across recomputation.
+            # checkpoint 重算不会再次记录同一步的共享参数。
             self.assertEqual(len([r for r in monitor.detail_buffer if r["type"] == "Param"]), 2)
             monitor.disable()
 
