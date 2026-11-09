@@ -59,4 +59,6 @@ $$
 
 `GradientMonitor` 的参数与梯度统计使用正确分片组聚合；loss 默认仍为 `rank_local`，不会自动汇总不同 rank 的 loss。Attention 结果同样是 `rank_local`，并记录采样 query 的数量及是否覆盖全部 query。不要把采样最大值当成完整 Attention 的最大值。
 
-建议的起始配置：梯度每 10 步，参数、Adam 状态和更新比例每 100 步，Attention 每 100 步且最多 32 个 query。频率是可调整起点，不能替代目标硬件上的吞吐和显存实测。
+包默认频率为梯度每 10 步，参数、Adam 状态和更新比例每 100 步，Attention 每 100 步；Attention 默认不限制 query 数量。这些是 API 默认值，未经目标硬件性能标定。
+
+用户现有监控每 1000 步执行一次，接力集成应先保留该诊断频率，再评估少量关键位置的高频采集。实时与间隔策略、性能待办及验收标准统一见[设计与集成接力文档](design_and_integration_handoff.md)。

@@ -2,6 +2,8 @@
 
 基于现有 `NumericalAnalyzer` 和 FSDP 梯度监控组件扩展的 PyTorch 训练数值监控包。提供前向统计、梯度统计、优化器状态、实际参数更新和 Attention 探针。
 
+**本地 Agent 接力入口：[设计与集成接力文档](docs/design_and_integration_handoff.md)**。包含全部指标定义、实时/间隔监控策略、实现映射、训练事件接入与验收要求；当前是低频诊断实现，轻量实时通道仍需性能优化。
+
 ## 安装与运行
 
 ```bash
